@@ -6,4 +6,4 @@ exclude = [ "fuzz", "tools/http3_test" ]
 debug = true
 
 [profile.release]
-debug = true
+debug = false

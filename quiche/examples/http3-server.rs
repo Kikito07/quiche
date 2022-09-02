@@ -55,39 +55,70 @@ struct Client {
 
 type ClientMap = HashMap<quiche::ConnectionId<'static>, Client>;
 
+
+const USAGE: &str = "Usage:
+  generic-http3-server [options]
+  generic-http3-server -h | --help
+
+Options:
+  -c PATH                   Path of the certificate file [default: /certs/cert.crt]
+  -k PATH                   The size of the request to perform [default: /certs/cert.key]
+  -l PATH                   The path to ouput the logs on (not implemented, currently only activated logging on stdout)
+  -p PORT                   The port number to listen on [default: 443]
+  -h --help                 Show this screen.
+";
+
+const MAX_REQUEST_SIZE: usize = 50000000000;
+
 fn main() {
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];
 
-    let mut args = std::env::args();
 
-    let cmd = &args.next().unwrap();
+    // Parse CLI parameters.
+    let docopt = docopt::Docopt::new(USAGE).unwrap();
+    let args: ServerArgs = ServerArgs::with_docopt(&docopt);
+    // env_logger::init();
 
-    if args.len() != 0 {
-        println!("Usage: {}", cmd);
-        println!("\nSee tools/apps/ for more complete implementations.");
-        return;
+    if args.logfile == "" {
+        log::set_max_level(log::LevelFilter::Off);
+        info!("disabling logs: should never be seen");
+    } else {
+        log::set_max_level(log::LevelFilter::Trace);
     }
 
+    let mut random_buffer =  Vec::<u8>::with_capacity(500000);
+
+    for _ in 0..random_buffer.capacity() {
+        let a: u8 = rand::random();
+        random_buffer.push(a);
+    }
+
+
     // Setup the event loop.
-    let mut poll = mio::Poll::new().unwrap();
+    let poll = mio::Poll::new().unwrap();
     let mut events = mio::Events::with_capacity(1024);
 
     // Create the UDP listening socket, and register it with the event loop.
-    let mut socket =
-        mio::net::UdpSocket::bind("127.0.0.1:4433".parse().unwrap()).unwrap();
-    poll.registry()
-        .register(&mut socket, mio::Token(0), mio::Interest::READABLE)
-        .unwrap();
+    let socket = net::UdpSocket::bind(format!("0.0.0.0:{}", args.port)).unwrap();
+
+    let socket = mio::net::UdpSocket::from_socket(socket).unwrap();
+    poll.register(
+        &socket,
+        mio::Token(0),
+        mio::Ready::readable(),
+        mio::PollOpt::edge(),
+    )
+    .unwrap();
 
     // Create the configuration for the QUIC connections.
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
 
     config
-        .load_cert_chain_from_pem_file("examples/cert.crt")
+        .load_cert_chain_from_pem_file(args.certfile.as_str())
         .unwrap();
     config
-        .load_priv_key_from_pem_file("examples/cert.key")
+        .load_priv_key_from_pem_file(args.keyfile.as_str())
         .unwrap();
 
     config
@@ -115,6 +146,8 @@ fn main() {
     let mut clients = ClientMap::new();
 
     let local_addr = socket.local_addr().unwrap();
+
+    let mut total_read_bytes = 0;
 
     loop {
         // Find the shorter timeout from all the active connections.
@@ -195,7 +228,7 @@ fn main() {
 
                     let out = &out[..len];
 
-                    if let Err(e) = socket.send_to(out, from) {
+                    if let Err(e) = socket.send_to(out, &from) {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
                             debug!("send() would block");
                             break;
@@ -232,7 +265,7 @@ fn main() {
 
                     let out = &out[..len];
 
-                    if let Err(e) = socket.send_to(out, from) {
+                    if let Err(e) = socket.send_to(out, &from) {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
                             debug!("send() would block");
                             break;
@@ -351,7 +384,7 @@ fn main() {
                                 client,
                                 stream_id,
                                 &list,
-                                "examples/root",
+                                &random_buffer,
                             );
                         },
 
@@ -361,6 +394,33 @@ fn main() {
                                 client.conn.trace_id(),
                                 stream_id
                             );
+                            loop {
+                                match http3_conn.recv_body(&mut client.conn, stream_id, &mut buf) {
+                                    Ok(n) => {
+                                        total_read_bytes += n;
+                                        info!("total read {} bytes", total_read_bytes);
+                                    },
+                                    Err(quiche::h3::Error::Done) => {
+                                        break;
+                                    },
+                                    Err(e) => {
+                                        panic!("recv_body failed: {:?}", e);
+                                    }
+                                }
+                            }
+                            if client.conn.stream_finished(stream_id) {
+                                let body_str = format!("{}", total_read_bytes);
+                                let body = body_str.as_bytes();
+                                let headers = vec![
+                                    quiche::h3::Header::new(b":status", 200.to_string().as_bytes()),
+                                    quiche::h3::Header::new(b"server", b"quiche"),
+                                    quiche::h3::Header::new(
+                                        b"content-length",
+                                        body.len().to_string().as_bytes(),
+                                    ),
+                                ];
+                                write_response(client, stream_id, headers, body.to_vec());
+                            }
                         },
 
                         Ok((_stream_id, quiche::h3::Event::Finished)) => (),
@@ -415,7 +475,7 @@ fn main() {
                     },
                 };
 
-                if let Err(e) = socket.send_to(&out[..write], send_info.to) {
+                if let Err(e) = socket.send_to(&out[..write], &send_info.to) {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         debug!("send() would block");
                         break;
@@ -501,28 +561,10 @@ fn validate_token<'a>(
     Some(quiche::ConnectionId::from_ref(&token[addr.len()..]))
 }
 
-/// Handles incoming HTTP/3 requests.
-fn handle_request(
-    client: &mut Client, stream_id: u64, headers: &[quiche::h3::Header],
-    root: &str,
-) {
+fn write_response(client: &mut Client, stream_id: u64, headers: Vec<quiche::h3::Header>, body: Vec<u8>) {
+
     let conn = &mut client.conn;
     let http3_conn = &mut client.http3_conn.as_mut().unwrap();
-
-    info!(
-        "{} got request {:?} on stream id {}",
-        conn.trace_id(),
-        hdrs_to_strings(headers),
-        stream_id
-    );
-
-    // We decide the response based on headers alone, so stop reading the
-    // request stream so that any body is ignored and pointless Data events
-    // are not generated.
-    conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0)
-        .unwrap();
-
-    let (headers, body) = build_response(root, headers);
 
     match http3_conn.send_response(conn, stream_id, &headers, false) {
         Ok(v) => v,
@@ -566,21 +608,61 @@ fn handle_request(
     }
 }
 
+/// Handles incoming HTTP/3 requests.
+fn handle_request(
+    client: &mut Client, stream_id: u64, headers: &[quiche::h3::Header], generator: &Vec<u8>,
+) {
+    let conn = &mut client.conn;
+
+    info!(
+        "{} got request {:?} on stream id {}",
+        conn.trace_id(),
+        headers,
+        stream_id
+    );
+
+    // Look for the request's path and method.
+    for hdr in headers {
+        match hdr.name() {
+
+            b":method" => {
+                if hdr.value() == b"POST" {
+                    // // We decide the response based on headers alone, so stop reading the
+                    // // request stream so that any body is ignored and pointless Data events
+                    // // are not generated.
+                    // conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0)
+                    //     .unwrap();
+                    return;
+                }
+                // method = Some(hdr.value())
+            },
+
+            _ => (),
+        }
+    }
+
+    // // We decide the response based on headers alone, so stop reading the
+    // // request stream so that any body is ignored and pointless Data events
+    // // are not generated.
+    conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0)
+        .unwrap();
+
+    let (headers, body) = build_random_response(headers, generator);
+
+    write_response(client, stream_id, headers, body);
+}
+
 /// Builds an HTTP/3 response given a request.
-fn build_response(
-    root: &str, request: &[quiche::h3::Header],
+fn build_random_response(request: &[quiche::h3::Header], generator: &Vec<u8>,
 ) -> (Vec<quiche::h3::Header>, Vec<u8>) {
-    let mut file_path = std::path::PathBuf::from(root);
-    let mut path = std::path::Path::new("");
+    let mut path_str = "";
     let mut method = None;
 
     // Look for the request's path and method.
     for hdr in request {
         match hdr.name() {
             b":path" =>
-                path = std::path::Path::new(
-                    std::str::from_utf8(hdr.value()).unwrap(),
-                ),
+                path_str = std::str::from_utf8(hdr.value()).unwrap(),
 
             b":method" => method = Some(hdr.value()),
 
@@ -590,16 +672,20 @@ fn build_response(
 
     let (status, body) = match method {
         Some(b"GET") => {
-            for c in path.components() {
-                if let std::path::Component::Normal(v) = c {
-                    file_path.push(v)
+            let mut path_string = path_str.to_string();
+            if path_string.remove(0) == '/' {
+                let request_size = usize::from_str_radix(path_string.as_str(), 10).unwrap();
+                if request_size > 0 && request_size < MAX_REQUEST_SIZE {
+                    let mut res = Vec::<u8>::with_capacity(request_size);
+                    while res.len() < request_size {
+                        res.extend_from_slice(&generator[0..std::cmp::min(generator.len(), request_size - res.len())])
+                    }
+                    (200, res)
+                } else {
+                    (404, b"Not Found!".to_vec())
                 }
-            }
-
-            match std::fs::read(file_path.as_path()) {
-                Ok(data) => (200, data),
-
-                Err(_) => (404, b"Not Found!".to_vec()),
+            } else {
+                (404, b"Not Found!".to_vec())
             }
         },
 
@@ -670,13 +756,34 @@ fn handle_writable(client: &mut Client, stream_id: u64) {
     }
 }
 
-pub fn hdrs_to_strings(hdrs: &[quiche::h3::Header]) -> Vec<(String, String)> {
-    hdrs.iter()
-        .map(|h| {
-            let name = String::from_utf8_lossy(h.name()).to_string();
-            let value = String::from_utf8_lossy(h.value()).to_string();
 
-            (name, value)
-        })
-        .collect()
+pub trait Args {
+    fn with_docopt(docopt: &docopt::Docopt) -> Self;
+}
+/// Application-specific arguments that compliment the `CommonArgs`.
+struct ServerArgs {
+    certfile: String,
+    keyfile: String,
+    logfile: String,
+    port: u16,
+}
+
+impl Args for ServerArgs {
+    fn with_docopt(docopt: &docopt::Docopt) -> Self {
+        let args = docopt.parse().unwrap_or_else(|e| e.exit());
+
+        let certfile = args.get_str("-c").to_string();
+        let keyfile = args.get_str("-k").to_string();
+        let logfile = args.get_str("-l").to_string();
+
+        let port = args.get_str("-p");
+        let port = u16::from_str_radix(port, 10).unwrap();
+
+        ServerArgs {
+            certfile,
+            keyfile,
+            logfile,
+            port,
+        }
+    }
 }
