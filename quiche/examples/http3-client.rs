@@ -40,7 +40,7 @@ const MAX_REQUEST_SIZE: usize = 50000000000;
 const USAGE: &str = "Usage:
   generic-http3-client [options] ADDRESS PORT
   generic-http3-client -h | --help
-
+  
 Options:
   -X PATH                  The path of the keylog file on which to dump the TLS keys [default: ./keys.log]
   -G BYTES                 The size of the request to perform [default: 50000]

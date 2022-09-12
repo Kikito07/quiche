@@ -68,12 +68,14 @@ sfv = { version = "0.9", optional = true }
 docopt = "1"
 rand = "0.7"
 env_logger = { version = "0.8.1" }
+nix = "0"
+mio = "0.6"
 
 [target."cfg(windows)".dependencies]
 winapi = { version = "0.3", features = ["wincrypt", "ws2def", "ws2ipdef", "ws2tcpip"] }
 
 [dev-dependencies]
-mio = "0.6"
+
 url = "1"
 
 [lib]

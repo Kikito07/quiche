@@ -29,11 +29,17 @@ extern crate log;
 
 use std::net;
 
+use std::cmp;
+
+use std::io;
+
 use std::collections::HashMap;
 
 use ring::rand::*;
 
 use quiche::h3::NameValue;
+
+const MAX_BUF_SIZE: usize = 65507;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
@@ -51,7 +57,14 @@ struct Client {
     http3_conn: Option<quiche::h3::Connection>,
 
     partial_responses: HashMap<u64, PartialResponse>,
+
+    max_datagram_size: usize,
+
+    loss_rate: f64,
+
+    max_send_burst: usize,
 }
+
 
 type ClientMap = HashMap<quiche::ConnectionId<'static>, Client>;
 
@@ -70,10 +83,108 @@ Options:
 
 const MAX_REQUEST_SIZE: usize = 50000000000;
 
-fn main() {
-    let mut buf = [0; 65535];
-    let mut out = [0; MAX_DATAGRAM_SIZE];
+fn send_to_gso_pacing(
+    socket: &mio::net::UdpSocket, buf: &[u8], send_info: &quiche::SendInfo,
+    segment_size: usize,
+) -> io::Result<usize> {
+    use nix::sys::socket::sendmsg;
+    use nix::sys::socket::ControlMessage;
+    use nix::sys::socket::MsgFlags;
+    use nix::sys::socket::SockaddrStorage;
+    use std::io::IoSlice;
+    use std::os::unix::io::AsRawFd;
 
+    let iov = [IoSlice::new(buf)];
+    let segment_size = segment_size as u16;
+    let dst = SockaddrStorage::from(send_info.to);
+    let sockfd = socket.as_raw_fd();
+
+    // GSO option.
+    let cmsg_gso = ControlMessage::UdpGsoSegments(&segment_size);
+    let nanos_per_sec: u64 = 1_000_000_000;
+
+    // Pacing option.
+    let mut time_spec = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            &send_info.at as *const _ as *const libc::timespec,
+            &mut time_spec,
+            1,
+        )
+    };
+
+    let send_time =
+        time_spec.tv_sec as u64 * nanos_per_sec + time_spec.tv_nsec as u64;
+
+    let cmsg_txtime = ControlMessage::TxTime(&send_time);
+    // println!("hello");
+    // println!("dst : {}",dst);
+    match sendmsg(
+        sockfd,
+        &iov,
+        &[cmsg_gso],
+        MsgFlags::empty(),
+        Some(&dst),
+    ) {
+        Ok(v) => Ok(v),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// A wrapper function of send_to().
+/// - when GSO and SO_TXTIME enabled, send a packet using send_to_gso().
+/// Otherwise, send packet using socket.send_to().
+pub fn send_to(
+    socket: &mio::net::UdpSocket, buf: &[u8], send_info: &quiche::SendInfo,
+    segment_size: usize, pacing: bool, enable_gso: bool,
+) -> io::Result<usize> {
+    if pacing && enable_gso {
+        match send_to_gso_pacing(socket, buf, send_info, segment_size) {
+            Ok(v) => {
+                return Ok(v);
+            },
+            Err(e) => {
+                return Err(e);
+            },
+        }
+    }
+
+    let mut off = 0;
+    let mut left = buf.len();
+    let mut written = 0;
+
+    while left > 0 {
+        let pkt_len = cmp::min(left, segment_size);
+
+        match socket.send_to(&buf[off..off + pkt_len], &send_info.to) {
+            Ok(v) => {
+                written += v;
+            },
+            Err(e) => return Err(e),
+        }
+
+        off += pkt_len;
+        left -= pkt_len;
+    }
+
+    Ok(written)
+}
+
+pub fn detect_gso(socket: &mio::net::UdpSocket, segment_size: usize) -> bool {
+    use nix::sys::socket::setsockopt;
+    use nix::sys::socket::sockopt::UdpGsoSegment;
+    use std::os::unix::io::AsRawFd;
+
+    setsockopt(socket.as_raw_fd(), UdpGsoSegment, &(segment_size as i32)).is_ok()
+}
+
+fn main() {
+    let mut buf = [0; MAX_BUF_SIZE];
+    let mut out = [0; MAX_BUF_SIZE];
 
     // Parse CLI parameters.
     let docopt = docopt::Docopt::new(USAGE).unwrap();
@@ -110,7 +221,7 @@ fn main() {
         mio::PollOpt::edge(),
     )
     .unwrap();
-
+    let max_datagram_size = MAX_DATAGRAM_SIZE;
     // Create the configuration for the QUIC connections.
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
 
@@ -309,6 +420,9 @@ fn main() {
                     conn,
                     http3_conn: None,
                     partial_responses: HashMap::new(),
+                    max_datagram_size,
+                    loss_rate : 0.0,
+                    max_send_burst: MAX_BUF_SIZE,
                 };
 
                 clients.insert(scid.clone(), client);
@@ -363,6 +477,8 @@ fn main() {
 
                 // TODO: sanity check h3 connection before adding to map
                 client.http3_conn = Some(h3_conn);
+                client.max_datagram_size =
+                    client.conn.max_send_udp_payload_size();
             }
 
             if client.http3_conn.is_some() {
@@ -459,23 +575,48 @@ fn main() {
         // packets to be sent.
         for client in clients.values_mut() {
             loop {
-                let (write, send_info) = match client.conn.send(&mut out) {
-                    Ok(v) => v,
-
-                    Err(quiche::Error::Done) => {
-                        debug!("{} done writing", client.conn.trace_id());
+                let max_send_burst = MAX_BUF_SIZE;
+                let mut total_write = 0;
+                let mut dst_info = None;
+                while total_write < max_send_burst {
+                    let (write, send_info) = match client
+                        .conn
+                        .send(&mut out[total_write..max_send_burst]) 
+                    {
+                        Ok(v) => v,
+    
+                        Err(quiche::Error::Done) => {
+                            debug!("{} done writing", client.conn.trace_id());
+                            break;
+                        },
+    
+                        Err(e) => {
+                            error!("{} send failed: {:?}", client.conn.trace_id(), e);
+                            client.conn.close(false, 0x1, b"fail").ok();
+                            break;
+                        },
+                    };
+    
+                    total_write += write;
+    
+                    let _ = dst_info.get_or_insert(send_info);
+                    
+                    if write < client.max_datagram_size {
                         break;
-                    },
-
-                    Err(e) => {
-                        error!("{} send failed: {:?}", client.conn.trace_id(), e);
-
-                        client.conn.close(false, 0x1, b"fail").ok();
-                        break;
-                    },
-                };
-
-                if let Err(e) = socket.send_to(&out[..write], &send_info.to) {
+                    }
+                }
+                if total_write == 0 || dst_info.is_none() {
+                    break;
+                }
+                
+                if let Err(e) = send_to(
+                    &socket,
+                    &out[..total_write],
+                    &dst_info.unwrap(),
+                    client.max_datagram_size,
+                    true,
+                    true,
+                ){
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         debug!("send() would block");
                         break;
@@ -484,7 +625,7 @@ fn main() {
                     panic!("send() failed: {:?}", e);
                 }
 
-                debug!("{} written {} bytes", client.conn.trace_id(), write);
+                debug!("{} written {} bytes", client.conn.trace_id(), total_write);
             }
         }
 
