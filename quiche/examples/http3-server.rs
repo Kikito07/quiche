@@ -198,7 +198,7 @@ fn main() {
         log::set_max_level(log::LevelFilter::Trace);
     }
 
-    let mut random_buffer =  Vec::<u8>::with_capacity(500000);
+    let mut random_buffer =  Vec::<u8>::with_capacity(50000000);
 
     for _ in 0..random_buffer.capacity() {
         let a: u8 = rand::random();
@@ -703,6 +703,7 @@ fn validate_token<'a>(
 }
 
 fn write_response(client: &mut Client, stream_id: u64, headers: Vec<quiche::h3::Header>, body: Vec<u8>) {
+    println!("inside write_response");
 
     let conn = &mut client.conn;
     let http3_conn = &mut client.http3_conn.as_mut().unwrap();

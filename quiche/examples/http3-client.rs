@@ -212,7 +212,8 @@ fn main() {
         quiche::h3::Header::new(b"user-agent", b"quiche"),
     ];
 
-    let req_start = std::time::Instant::now();
+    let mut req_start = std::time::Instant::now();
+    let mut first_data_packet_received = false;
     
     let mut elapsed: i128 = -1;
 
@@ -254,7 +255,7 @@ fn main() {
                     panic!("recv() failed: {:?}", e);
                 },
             };
-
+            
             debug!("got {} bytes", len);
 
             let recv_info = quiche::RecvInfo {
@@ -333,6 +334,12 @@ fn main() {
                         while let Ok(read) =
                             http3_conn.recv_body(&mut conn, stream_id, &mut buf)
                         {
+                            if !first_data_packet_received {
+                                println!("inside");
+                                req_start = std::time::Instant::now();
+                                first_data_packet_received = true;
+                            }
+                            
                             debug!(
                                 "got {} bytes of response data on stream {}",
                                 read, stream_id
@@ -425,7 +432,7 @@ fn main() {
     }
     println!("got {} bytes in total", total_bytes);
     println!("{} ms", (elapsed as f64)/1000.0);
-    println!("goodput : {} Mbps", ((total_bytes as f64) * 8.0)/((elapsed as f64)));
+    println!("goodput : {} Mbps", ((args.request_size as f64) * 8.0)/((elapsed as f64)));
     println!("done!!!");
 }
 
